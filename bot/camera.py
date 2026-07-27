@@ -110,7 +110,10 @@ class Camera:
 
         self.light_timeout: int = config.camera.light_timeout
         self.light_device: PowerDevice = self._klippy.light_device
-        self._camera_lock: threading.Lock = threading.Lock()
+        # A re-entrant lock lets video capture call take_photo while preventing
+        # the notifier and timelapse workers from hitting small MJPEG cameras
+        # concurrently.
+        self._camera_lock: threading.RLock = threading.RLock()
         self.light_lock = threading.Lock()
         self.light_timer_event: threading.Event = threading.Event()
         self.light_timer_event.set()
@@ -648,6 +651,11 @@ class MjpegCamera(Camera):
         self._raw_frame_extension: str = "jpeg"
         self._host = config.camera.host
         self._host_snapshot = config.camera.host_snapshot if config.camera.host_snapshot else self._host.replace("stream", "snapshot")
+        self._snapshot_client = httpx.Client(
+            timeout=httpx.Timeout(5.0, connect=2.0),
+            verify=False,
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
+        )
 
         self._rotate_code_mjpeg: Image.Transpose
         if config.camera.rotate == "90_cw":
@@ -674,28 +682,27 @@ class MjpegCamera(Camera):
         bio = BytesIO()
         os_nice(15)
         try:
-            # Todo: speedup coonections?
-            response = httpx.get(f"{self._host_snapshot}", timeout=5, verify=False)
-
-            os_nice(15)
-            if response.is_success and response.headers["Content-Type"] == "image/jpeg":
+            with self._camera_lock:
+                response = self._snapshot_client.get(self._host_snapshot)
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "").lower()
+                if not content_type.startswith("image/jpeg"):
+                    raise ValueError(f"Unexpected snapshot content type: {content_type or 'missing'}")
 
                 if force_rotate:
-                    img = self._rotate_img(Image.open(BytesIO(response.content)).convert("RGB"))
-                    img.save(bio, format="JPEG")
-                    img.close()
-                    del img
+                    with Image.open(BytesIO(response.content)) as source:
+                        img = self._rotate_img(source.convert("RGB"))
+                        img.save(bio, format="JPEG", quality=85, optimize=False)
+                        img.close()
                 else:
                     bio.write(response.content)
-            else:
-                response.raise_for_status()
-        except HTTPError as err:
+        except (HTTPError, OSError, ValueError) as err:
             logger.error("Streamer snapshot get failed\n%s", err)
             if force_rotate:
                 with Image.open("../imgs/nosignal.png").convert("RGB") as img:
                     img.save(bio, format="JPEG")
-
-        os_nice(0)
+        finally:
+            os_nice(0)
         bio.seek(0)
         return bio
 

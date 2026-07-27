@@ -215,6 +215,10 @@ class Klippy:
         return self._get_full_marco_list()
 
     @property
+    def printer_objects(self) -> List[str]:
+        return self._objects_list.copy()
+
+    @property
     def moonraker_host(self) -> str:
         return self._host
 
@@ -266,16 +270,20 @@ class Klippy:
         return self._printing_filename
 
     async def set_printing_filename(self, new_value: str):
+        if new_value == self._printing_filename:
+            return
         if not new_value:
-            logger.info("'filename' has the same value as the current: %s", new_value)
             self._reset_file_info()
             return
 
         response = await self.make_request("GET", f"/server/files/metadata?filename={urllib.parse.quote(new_value)}")
-        # Todo: add response status check!
         if not response.is_success:
             logger.warning("bad response for file request %s", response.status_code)
-        resp = orjson.loads(response.text)["result"]
+            return
+        resp = orjson.loads(response.text).get("result", {})
+        if not resp:
+            logger.warning("empty metadata response for %s", new_value)
+            return
         self._printing_filename = new_value
         self.file_estimated_time = resp["estimated_time"] if resp.get("estimated_time") else 0.0
         self.file_print_start_time = resp["print_start_time"] if resp.get("print_start_time") else time.time()
@@ -392,7 +400,7 @@ class Klippy:
             except Exception as ex:
                 logger.error(ex, exc_info=True)
             retries += 1
-            time.sleep(1)
+            await asyncio.sleep(1)
         return f"Connection failed. {last_reason}"
 
     def update_sensor(self, name: str, value) -> None:

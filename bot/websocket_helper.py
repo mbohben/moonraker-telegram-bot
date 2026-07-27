@@ -1,3 +1,4 @@
+import asyncio
 from functools import wraps
 import logging
 import os
@@ -58,6 +59,10 @@ class WebSocketHelper:
         self._log_parser: bool = config.bot_config.log_parser
 
         self._ws: ClientConnection
+        self._identified: bool = False
+        self._metadata_task: asyncio.Task = None  # type: ignore
+        self._metadata_filename: str = ""
+        self._filament_detected: dict[str, bool] = {}
 
         if config.bot_config.debug:
             logger.setLevel(logging.DEBUG)
@@ -85,6 +90,13 @@ class WebSocketHelper:
         sensors = self._klippy.prepare_sens_dict_subscribe()
         if sensors:
             subscribe_objects.update(sensors)
+        subscribe_objects.update(
+            {
+                obj: ["enabled", "filament_detected"]
+                for obj in self._klippy.printer_objects
+                if obj.startswith(("filament_switch_sensor ", "filament_motion_sensor "))
+            }
+        )
 
         await self._ws.send(
             orjson.dumps(
@@ -98,8 +110,48 @@ class WebSocketHelper:
         )
 
     async def on_open(self):
+        if not self._identified:
+            await self._ws.send(
+                orjson.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "server.connection.identify",
+                        "params": {
+                            "client_name": "moonraker-telegram-bot",
+                            "version": "development",
+                            "type": "bot",
+                            "url": "https://github.com/mbohben/moonraker-telegram-bot",
+                        },
+                        "id": self._my_id,
+                    }
+                )
+            )
+            self._identified = True
         await self._ws.send(orjson.dumps({"jsonrpc": "2.0", "method": "printer.info", "id": self._my_id}))
         await self._ws.send(orjson.dumps({"jsonrpc": "2.0", "method": "machine.device_power.devices", "id": self._my_id}))
+
+    def _metadata_done(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            logger.exception("Failed to update G-Code metadata for %s", self._metadata_filename)
+
+    def _schedule_metadata_update(self, filename: str) -> None:
+        if not filename or filename == self._klippy.printing_filename:
+            return
+        if self._metadata_task and not self._metadata_task.done():
+            if filename == self._metadata_filename:
+                return
+            self._metadata_task.cancel()
+        self._metadata_filename = filename
+        self._metadata_task = asyncio.create_task(self._klippy.set_printing_filename(filename), name="gcode_metadata")
+        self._metadata_task.add_done_callback(self._metadata_done)
+
+    async def _wait_for_metadata(self) -> None:
+        if self._metadata_task and not self._metadata_task.done():
+            await self._metadata_task
 
     async def reshedule(self):
         if not self._klippy.connected and self._ws.state is State.OPEN:
@@ -115,7 +167,7 @@ class WebSocketHelper:
             print_stats = status_resp["print_stats"]
             if print_stats["state"] in ["printing", "paused"]:
                 self._klippy.printing = True
-                await self._klippy.set_printing_filename(print_stats["filename"])
+                self._schedule_metadata_update(print_stats["filename"])
                 self._klippy.printing_duration = print_stats["print_duration"]
                 self._klippy.filament_used = print_stats["filament_used"]
                 # Todo: maybe get print start time and set start interval for job?
@@ -138,7 +190,9 @@ class WebSocketHelper:
             self._klippy.printing_progress = status_resp["display_status"]["progress"]
         if "virtual_sdcard" in status_resp:
             self._klippy.vsd_progress = status_resp["virtual_sdcard"]["progress"]
+            self._klippy.printing_progress = self._klippy.vsd_progress
 
+        self.parse_filament_sensors(status_resp)
         self.parse_sensors(status_resp)
 
     async def notify_gcode_reponse(self, message_params):
@@ -203,16 +257,40 @@ class WebSocketHelper:
         if "gcode_move" in message_params_loc and "gcode_position" in message_params_loc["gcode_move"]:
             position_z = message_params_loc["gcode_move"]["gcode_position"][2]
             self._klippy.printing_height = position_z
-            self._notifier.schedule_notification(position_z=int(position_z))
+            self._notifier.schedule_notification(position_z=position_z)
             self._timelapse.take_lapse_photo(position_z)
 
         if "virtual_sdcard" in message_params_loc and "progress" in message_params_loc["virtual_sdcard"]:
             self._klippy.vsd_progress = message_params_loc["virtual_sdcard"]["progress"]
+            self._klippy.printing_progress = self._klippy.vsd_progress
+            self._notifier.schedule_notification(progress=int(self._klippy.vsd_progress * 100))
 
         if "print_stats" in message_params_loc:
             await self.parse_print_stats(message_params)
 
+        self.parse_filament_sensors(message_params_loc)
         self.parse_sensors(message_params_loc)
+
+    def parse_filament_sensors(self, message_parts_loc):
+        for sensor_name in [
+            key
+            for key in message_parts_loc
+            if key.startswith(("filament_switch_sensor ", "filament_motion_sensor "))
+        ]:
+            sensor = message_parts_loc[sensor_name]
+            if "filament_detected" not in sensor:
+                continue
+            detected = bool(sensor["filament_detected"])
+            previous = self._filament_detected.get(sensor_name)
+            self._filament_detected[sensor_name] = detected
+            if (
+                detected is False
+                and previous is not False
+                and sensor.get("enabled", True)
+                and self._klippy.printing
+            ):
+                display_name = sensor_name.split(" ", 1)[1]
+                self._notifier.send_error(f"Filament runout detected: {display_name}")
 
     def parse_sensors(self, message_parts_loc):
         for sens in [key for key in message_parts_loc if key.startswith("temperature_sensor")]:
@@ -238,7 +316,7 @@ class WebSocketHelper:
         # Fixme:  maybe do not parse without state? history data may not be avaliable
         # Message with filename will be sent before printing is started
         if "filename" in print_stats_loc:
-            await self._klippy.set_printing_filename(print_stats_loc["filename"])
+            self._schedule_metadata_update(print_stats_loc["filename"])
         if "filament_used" in print_stats_loc:
             self._klippy.filament_used = print_stats_loc["filament_used"]
         if "state" in print_stats_loc:
@@ -253,7 +331,7 @@ class WebSocketHelper:
                 await self._notifier.reset_notifications()
                 self._notifier.add_notifier_timer()
                 if not self._klippy.printing_filename:
-                    await self._klippy.get_status()
+                    await self._wait_for_metadata()
                 if not self._timelapse.manual_mode:
                     self._timelapse.clean()
                     self._timelapse.is_running = True
@@ -429,6 +507,7 @@ class WebSocketHelper:
         ):
             try:
                 self._ws = websocket
+                self._identified = False
                 self._scheduler.add_job(self.reshedule, "interval", seconds=2, id="ws_reschedule", replace_existing=True, coalesce=True, misfire_grace_time=10)
                 # async for message in self._ws:
                 #     await self.websocket_to_message(message)

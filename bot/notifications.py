@@ -54,7 +54,7 @@ class Notifier:
         self._status_message_m117_update: bool = config.telegram_ui.status_message_m117_update
         self._message_parts: List[str] = config.status_message_content.content
 
-        self._last_height: int = 0
+        self._last_height: float = 0.0
         self._last_percent: int = 0
         self._last_m117_status: str = ""
         self._last_tgnotify_status: str = ""
@@ -62,6 +62,8 @@ class Notifier:
         self._status_message: Optional[Message] = None
         self._bzz_mess_id: int = 0
         self._groups_status_mesages: Dict[int, Message] = {}
+        self._notification_running: bool = False
+        self._pending_notification: Optional[Tuple[str, bool]] = None
 
         if logging_handler:
             logger.addHandler(logging_handler)
@@ -233,7 +235,7 @@ class Notifier:
     async def _notify(self, message: str, silent: bool, group_only: bool = False, manual: bool = False, finish: bool = False) -> None:
         try:
             if not self._cam_wrap.enabled:
-                await self._send_message(message, silent, manual)
+                await self._send_message(message, silent, group_only, manual)
             else:
                 await self._send_photo(group_only, manual, message, silent)
         except Exception as ex:
@@ -318,7 +320,6 @@ class Notifier:
     async def reset_notifications(self) -> None:
         self._last_percent = 0
         self._last_height = 0
-        self._klippy.printing_duration = 0
         self._last_m117_status = ""
         self._last_tgnotify_status = ""
         self._status_message = None
@@ -331,7 +332,7 @@ class Notifier:
             finally:
                 self._bzz_mess_id = 0
 
-    def _schedule_notification(self, message: str = "", schedule: bool = False, finish: bool = False) -> None:  # pylint: disable=W0613
+    def _build_notification_message(self, message: str = "") -> str:
         mess = escape_markdown(self._klippy.get_print_stats(message), version=2)
         if self._last_m117_status and "m117_status" in self._message_parts:
             mess += f"{escape_markdown(self._last_m117_status, version=2)}\n"
@@ -339,14 +340,40 @@ class Notifier:
             mess += f"{escape_markdown(self._last_tgnotify_status, version=2)}\n"
         if "last_update_time" in self._message_parts:
             mess += f"_Last update at {datetime.now():%H:%M:%S}_"
+        return mess
 
+    async def _run_pending_notification(self) -> None:
+        try:
+            while self._pending_notification is not None:
+                message, finish = self._pending_notification
+                self._pending_notification = None
+                await self._notify(
+                    self._build_notification_message(message),
+                    self._silent_progress,
+                    self._group_only,
+                    finish=finish,
+                )
+        finally:
+            self._notification_running = False
+            # A callback can arrive between the loop check and the finally block.
+            if self._pending_notification is not None:
+                self._schedule_notification(*self._pending_notification)
+
+    def _schedule_notification(self, message: str = "", finish: bool = False, schedule: bool = False) -> None:  # pylint: disable=W0613
+        # Keep only the newest status while an ESP32 snapshot/upload is in
+        # progress. This prevents stale messages and unbounded scheduler jobs.
+        self._pending_notification = (message, finish)
+        if self._notification_running:
+            return
+
+        self._notification_running = True
         self._sched.add_job(
-            self._notify,
-            kwargs={"message": mess, "silent": self._silent_progress, "group_only": self._group_only, "finish": finish},
+            self._run_pending_notification,
+            id="progress_notification",
             misfire_grace_time=180,
-            coalesce=False,
-            max_instances=6,
-            replace_existing=False,
+            coalesce=True,
+            max_instances=1,
+            replace_existing=True,
         )
 
         # if schedule:
@@ -365,22 +392,24 @@ class Notifier:
         # else:
         #     self._notify(mess, self._silent_progress, self._group_only)
 
-    def schedule_notification(self, progress: int = 0, position_z: int = 0) -> None:
+    def schedule_notification(self, progress: int = 0, position_z: float = 0) -> None:
         if not self._klippy.printing or self._klippy.printing_duration <= 0.0 or (self._height == 0 and self._percent == 0):
             return
 
         notify = False
         if progress != 0 and self._percent != 0:
-            if progress < self._last_percent - self._percent:
-                self._last_percent = progress
-            if progress % self._percent == 0 and progress > self._last_percent:
+            if progress < self._last_percent:
+                self._last_percent = progress - (progress % self._percent)
+            next_percent = ((self._last_percent // self._percent) + 1) * self._percent
+            if progress >= next_percent:
                 self._last_percent = progress
                 notify = True
 
         if position_z != 0 and self._height != 0:
-            if position_z < self._last_height - self._height:
-                self._last_height = position_z
-            if position_z % self._height == 0 and position_z > self._last_height:
+            if position_z < self._last_height:
+                self._last_height = position_z - (position_z % self._height)
+            next_height = (int(self._last_height // self._height) + 1) * self._height
+            if position_z >= next_height:
                 self._last_height = position_z
                 notify = True
 

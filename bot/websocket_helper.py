@@ -59,7 +59,6 @@ class WebSocketHelper:
         self._log_parser: bool = config.bot_config.log_parser
 
         self._ws: ClientConnection
-        self._identified: bool = False
         self._metadata_task: asyncio.Task = None  # type: ignore
         self._metadata_filename: str = ""
         self._filament_detected: dict[str, bool] = {}
@@ -110,23 +109,6 @@ class WebSocketHelper:
         )
 
     async def on_open(self):
-        if not self._identified:
-            await self._ws.send(
-                orjson.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "method": "server.connection.identify",
-                        "params": {
-                            "client_name": "moonraker-telegram-bot",
-                            "version": "development",
-                            "type": "bot",
-                            "url": "https://github.com/mbohben/moonraker-telegram-bot",
-                        },
-                        "id": self._my_id,
-                    }
-                )
-            )
-            self._identified = True
         await self._ws.send(orjson.dumps({"jsonrpc": "2.0", "method": "printer.info", "id": self._my_id}))
         await self._ws.send(orjson.dumps({"jsonrpc": "2.0", "method": "machine.device_power.devices", "id": self._my_id}))
 
@@ -507,7 +489,6 @@ class WebSocketHelper:
         ):
             try:
                 self._ws = websocket
-                self._identified = False
                 self._scheduler.add_job(self.reshedule, "interval", seconds=2, id="ws_reschedule", replace_existing=True, coalesce=True, misfire_grace_time=10)
                 # async for message in self._ws:
                 #     await self.websocket_to_message(message)
